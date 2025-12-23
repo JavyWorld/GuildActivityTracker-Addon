@@ -3,6 +3,7 @@ local GAT = _G[addonName] or {}
 _G[addonName] = GAT
 
 GAT.version = "4.0"
+local TARGET_GUILD_NAME = "Nexonir"
 
 function GAT:Print(msg)
     print("|cff00ff00[GAT]|r " .. msg)
@@ -23,8 +24,19 @@ local function UpdatePlayerAndGuild()
     GAT.guildName = GetGuildInfo("player") or ""
 end
 
+local function NotifyIfWrongGuild()
+    if GAT.guildNoticeShown then return end
+
+    if not GAT:IsInGuild() then
+        GAT.guildNoticeShown = true
+        GAT:Print("Solo recopila datos para la hermandad " .. TARGET_GUILD_NAME .. ". Este personaje no será trackeado.")
+    end
+end
+
 function GAT:IsInGuild()
-    return GAT.guildName == "Nexonir"
+    -- Consultamos el nombre de hermandad en vivo para evitar valores obsoletos
+    local current = (GetGuildInfo("player") or GAT.guildName or ""):lower()
+    return current ~= "" and current == TARGET_GUILD_NAME:lower()
 end
 
 f:SetScript("OnEvent", function(_, event, arg1)
@@ -53,6 +65,7 @@ f:SetScript("OnEvent", function(_, event, arg1)
 
     if event == "PLAYER_ENTERING_WORLD" or event == "GUILD_ROSTER_UPDATE" then
         UpdatePlayerAndGuild()
+        NotifyIfWrongGuild()
     end
 end)
 
