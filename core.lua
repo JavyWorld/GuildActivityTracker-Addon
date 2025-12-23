@@ -25,7 +25,8 @@ local function UpdatePlayerAndGuild()
 end
 
 function GAT:IsInGuild()
-    local current = (GAT.guildName or ""):lower()
+    -- Consultamos el nombre de hermandad en vivo para evitar valores obsoletos
+    local current = (GetGuildInfo("player") or GAT.guildName or ""):lower()
     return current ~= "" and current == TARGET_GUILD_NAME:lower()
 end
 
