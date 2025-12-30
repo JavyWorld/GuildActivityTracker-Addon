@@ -17,6 +17,7 @@ local PREFIX = GAT.ADDON_PREFIX or "GATSYNC"
 local HEARTBEAT_INTERVAL = 5
 local ROLE_TICK_INTERVAL  = 3
 local MASTER_TIMEOUT      = 22
+local PROBE_COOLDOWN      = 10
 
 local FLUSH_INTERVAL      = 6     -- flush de deltas del líder
 local OUTBOX_INTERVAL     = 0.25  -- envío 1 msg cada tick (evita throttle)
@@ -437,6 +438,8 @@ local function markPeer(sender, payload)
     local cid = payload.from
     if not cid or cid == "" then return end
 
+    local nowTS = now()
+
     local isNew = (sd.peers[cid] == nil)
     local peer = sd.peers[cid] or {}
 
@@ -446,7 +449,17 @@ local function markPeer(sender, payload)
     peer.name   = pname or peer.name or sender
     peer.isMaster = payload.master == "1"
     peer.rev = tonumber(payload.rev or peer.rev or 0) or 0
-    peer.lastSeen = now()
+    peer.role = payload.role or peer.role
+    peer.realm = payload.realm or peer.realm
+
+    local wasOnline = peer.online
+    peer.lastSeen = nowTS
+    peer.online = true
+    peer.lastOnline = peer.lastOnline or nowTS
+    peer.lastOffline = peer.lastOffline or 0
+    if wasOnline == false then
+        GAT:SysMsg("sync_peer_on_" .. cid, "Sync: " .. (peer.name or cid) .. " online", true)
+    end
 
     sd.peers[cid] = peer
 
@@ -462,14 +475,31 @@ local function markPeer(sender, payload)
             end)
         end
     end
+
+    -- Marca al GM inmediatamente y fuerza reevaluar rol/backlog sin esperar el siguiente tick.
+    if payload.master == "1" then
+        sd.masterPeerId = cid
+        sd.masterOnline = true
+        if not GAT:IsMasterBuild() then
+            computeRole()
+            trySendBacklog()
+        end
+    end
 end
 
 local function prunePeers()
     local sd = ensureSyncDB()
     local t = now()
     for cid, peer in pairs(sd.peers or {}) do
+        if peer.lastSeen and (t - peer.lastSeen) > MASTER_TIMEOUT then
+            if peer.online ~= false then
+                peer.online = false
+                peer.lastOffline = t
+                GAT:SysMsg("sync_peer_off_" .. cid, "Sync: " .. (peer.name or cid) .. " offline", true)
+            end
+        end
         if peer.lastSeen and (t - peer.lastSeen) > (MASTER_TIMEOUT * 3) then
-            sd.peers[cid] = nil
+            sd.peers[cid] = nil -- Limpieza profunda
         end
     end
 end
@@ -497,9 +527,13 @@ local function computeRole()
     -- Presence transitions (informative)
     if sd._prevMasterOnline ~= nil and sd._prevMasterOnline ~= masterOnline then
         if masterOnline then
-            GAT:Print("Sync: GM detectado (ONLINE).")
+            GAT:SysMsg("sync_gm_online", "Sync: GM detectado (ONLINE).", true)
+            if sd.backlog and hasValues(sd.backlog) then
+                GAT:SysMsg("sync_backlog_flush", "GM detectado. Pasando datos al GM...", true)
+                trySendBacklog()
+            end
         else
-            GAT:Print("Sync: GM no detectado (OFFLINE).")
+            GAT:SysMsg("sync_gm_offline", "Sync: GM no detectado (OFFLINE).", true)
         end
     end
     sd._prevMasterOnline = masterOnline
@@ -517,17 +551,25 @@ local function computeRole()
 
     local newRole = sd.role or "idle"
 
+    local helperCandidates = {}
+    for cid, peer in pairs(sd.peers or {}) do
+        if not peer.isMaster and peer.lastSeen and (t - peer.lastSeen) <= MASTER_TIMEOUT then
+            helperCandidates[#helperCandidates + 1] = cid
+        end
+    end
+
     if masterOnline then
         newRole = GAT:IsMasterBuild() and "master" or "idle"
     else
-        local candidates = { sd.clientId }
-        for cid, peer in pairs(sd.peers or {}) do
-            if not peer.isMaster and peer.lastSeen and (t - peer.lastSeen) <= MASTER_TIMEOUT then
-                candidates[#candidates + 1] = cid
-            end
+        helperCandidates[#helperCandidates + 1] = sd.clientId
+        table.sort(helperCandidates)
+        if helperCandidates[1] == sd.clientId then
+            newRole = "collector"
+        elseif #helperCandidates > 1 then
+            newRole = "follower"
+        else
+            newRole = "collector"
         end
-        table.sort(candidates)
-        newRole = (candidates[1] == sd.clientId) and "collector" or "idle"
     end
 
     if newRole ~= sd.role then
@@ -644,11 +686,15 @@ end
 -- =============================================================================
 local function sendHeartbeat()
     local sd = ensureSyncDB()
-    local msg = string.format("T=HB|from=%s|master=%s|rev=%s|name=%s",
+    local role = sd.role or "idle"
+    local msg = string.format("T=HB|from=%s|master=%s|rev=%s|name=%s|role=%s|realm=%s|ts=%d",
         tostring(sd.clientId),
         GAT:IsMasterBuild() and "1" or "0",
         tostring(sd.rev or 0),
-        tostring(GAT.fullPlayerName or "")
+        tostring(GAT.fullPlayerName or ""),
+        tostring(role),
+        tostring(select(2, UnitFullName("player")) or GetRealmName() or ""),
+        now()
     )
     queueOutbox("GUILD", nil, msg)
 end
@@ -780,6 +826,16 @@ end
 -- =============================================================================
 -- Manual sync (botón)
 -- =============================================================================
+local function sendProbeForMaster(reason)
+    local sd = ensureSyncDB()
+    local nowTS = now()
+    if sd._lastProbeAt and (nowTS - sd._lastProbeAt) < PROBE_COOLDOWN then return end
+    sd._lastProbeAt = nowTS
+    local msg = string.format("T=PROBE|from=%s|reason=%s|name=%s", tostring(sd.clientId), pctEncode(reason or "sync"), pctEncode(GAT.fullPlayerName or ""))
+    queueOutbox("GUILD", nil, msg)
+    GAT:SysMsg("sync_probe", "Sync: buscando GM...", true)
+end
+
 function GAT:Sync_Manual()
     local sd = ensureSyncDB()
     if self:IsMasterBuild() then
@@ -795,7 +851,12 @@ function GAT:Sync_Manual()
         local master = getMasterPeer()
         if not master or not master.sender then
             sd._manualSyncWantedAt = now()
-            self:Print("Sync: no veo al GM aún (esperando heartbeat). Si el GM está online, espera unos segundos y vuelve a tocar Sync.")
+            if sd.masterOnline then
+                self:Print("Buscando GM...")
+            else
+                self:Print("GM offline. No puedo sincronizar ahora.")
+            end
+            sendProbeForMaster("manual")
             return
         end
         local req = string.format("T=REQSNAP|from=%s", tostring(sd.clientId))
@@ -820,6 +881,10 @@ function GAT:Sync_GetHelpersForUI()
             lastSeenAgo = peer.lastSeen and (t - peer.lastSeen) or 9999,
             rev = peer.rev or 0,
             lastSyncTS = peer.lastSyncTS or 0,
+            online = peer.online ~= false,
+            lastOnline = peer.lastOnline or 0,
+            lastOffline = peer.lastOffline or 0,
+            role = peer.role or "unknown",
         }
     end
     table.sort(out, function(a,b)
@@ -862,6 +927,17 @@ local function onAddonMessage(prefix, msg, channel, sender)
             GAT:SysMsg("sync_req_from_" .. tostring(sender), "Sync: snapshot solicitado por " .. tostring(sender), true)
             GAT:Sync_SendSnapshotTo(sender)
         end
+        return
+    end
+
+    if t == "PROBE" and GAT:IsMasterBuild() then
+        local reply = string.format("T=MASTER_HERE|from=%s|master=1|name=%s|rev=%s|role=master", tostring(ensureSyncDB().clientId), tostring(GAT.fullPlayerName or ""), tostring(ensureSyncDB().rev or 0))
+        queueOutbox("WHISPER", sender, reply)
+        return
+    end
+
+    if t == "MASTER_HERE" then
+        markPeer(sender, meta)
         return
     end
 
