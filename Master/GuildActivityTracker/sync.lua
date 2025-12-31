@@ -465,10 +465,6 @@ function GAT:Sync_GetHelpersForUI()
     table.sort(list, function(a, b) return (a.lastSeenTS or 0) > (b.lastSeenTS or 0) end)
     return list
 end
-    end
-    table.sort(list, function(a, b) return (a.lastSeenTS or 0) > (b.lastSeenTS or 0) end)
-    return list
-end
 
 function GAT:Sync_BroadcastDelete(name)
     if not self:IsMasterBuild() or not name then return end
@@ -519,9 +515,6 @@ local function parseLine(msg)
     end
 
     return meta
-end
-    end
-    return out
 end
 
 local function handleComplete(payload, meta, sender)
@@ -590,32 +583,6 @@ local function handleComplete(payload, meta, sender)
             sendSnapshot(sender)
             GAT:SysMsg("tx_snap_to_" .. sender, ("Enviando snapshot a %s..."):format(sender), COLOR_BLUE, false)
         end
-        return
-    end
-end
-        return
-    end
-    if typ == "BACK" then
-        if not GAT:IsMasterBuild() then return end
-        local delta = decodeDelta(payload)
-        local sd = ensureSyncDB()
-        local lastSeq = (sd.lastAppliedSeqByPeer or {})[meta.from] or 0
-        local seqNum = tonumber(meta.seq) or 0
-        if seqNum > lastSeq then
-            applyDelta(delta)
-            sd.lastAppliedSeqByPeer[meta.from] = seqNum
-            chunkAndSend("ACK", sd.sessionNonce or now(), sd.clientId, seqNum, "", "WHISPER", sender)
-            GAT:SysMsg("rx_backlog", "Sync recibido de ayudante.", COLOR_GREEN, false)
-            sendSnapshot(sender)
-        else
-            chunkAndSend("ACK", sd.sessionNonce or now(), sd.clientId, seqNum, "", "WHISPER", sender)
-        end
-        return
-    end
-    if typ == "SNAP" then
-        local snap = decodeSnapshot(payload)
-        applySnapshot(snap)
-        GAT:SysMsg("snap_ok", "Sync aplicado.", COLOR_GREEN, false)
         return
     end
 end
@@ -695,10 +662,6 @@ local function sendHeartbeat()
     )
     sendAddonMessage("GUILD", nil, msg)
 end
-    local sd = ensureSyncDB()
-    local msg = string.format("T=HB|from=%s|master=%s|name=%s", sd.clientId, GAT:IsMasterBuild() and "1" or "0", GAT.fullPlayerName or "")
-    sendAddonMessage("GUILD", nil, msg)
-end
 
 local function updateHelpersMessage()
     local sd = ensureSyncDB()
@@ -746,18 +709,6 @@ local function updateHelpersMessage()
 
     sd._helpersCount = curCount
     sd._onlineHelpers = curSet
-end
-    end
-    table.sort(helpers)
-    local prev = sd._helpersCount or 0
-    local color = COLOR_WHITE
-    if #helpers > prev then color = COLOR_GREEN elseif #helpers < prev then color = COLOR_RED end
-    sd._helpersCount = #helpers
-    local msg = "Ayudantes online: " .. GAT:Color(color, tostring(#helpers))
-    if #helpers > 0 then
-        msg = msg .. " " .. GAT:Color(COLOR_WHITE, "(" .. table.concat(helpers, ", ") .. ")")
-    end
-    GAT:SysMsg("helpers_online", msg, nil, false)
 end
 
 function GAT:Sync_Init()
