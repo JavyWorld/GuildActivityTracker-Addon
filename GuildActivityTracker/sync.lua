@@ -29,6 +29,12 @@ local MAX_MSG_LEN         = 240
 -- Stats incluidos en snapshots (últimos 7 días)
 local SNAPSHOT_STATS_WINDOW = 7 * 24 * 3600
 
+-- Forward decls (para evitar referencias nil en definiciones adelantadas)
+local computeRole
+local getMasterPeer
+local buildHelperNetworkSummary
+local emitHelperNetworkStatus
+
 -- =============================================================================
 -- Utilidades
 -- =============================================================================
@@ -544,7 +550,7 @@ local function prunePeers()
     end
 end
 
-local function buildHelperNetworkSummary()
+buildHelperNetworkSummary = function()
     local sd = ensureSyncDB()
     local t = now()
 
@@ -600,7 +606,7 @@ local function buildHelperNetworkSummary()
     return summary
 end
 
-local function emitHelperNetworkStatus(tag)
+emitHelperNetworkStatus = function(tag)
     local summary = buildHelperNetworkSummary()
     if not summary then return end
 
@@ -619,7 +625,7 @@ local function emitHelperNetworkStatus(tag)
     GAT:SysMsg("sync_topology_status", msg, true)
 end
 
-local function computeRole()
+computeRole = function()
     local sd = ensureSyncDB()
     prunePeers()
 
@@ -700,7 +706,7 @@ local function computeRole()
     return newRole
 end
 
-local function getMasterPeer()
+getMasterPeer = function()
     local sd = ensureSyncDB()
     if not sd.masterPeerId then return nil end
     return (sd.peers or {})[sd.masterPeerId]
