@@ -126,6 +126,23 @@ local function pumpOutbox()
     end
 end
 
+local function countValues(tbl)
+    local count = 0
+    if not tbl then return count end
+    for _ in pairs(tbl) do
+        count = count + 1
+    end
+    return count
+end
+
+local function getPeerName(meta, sender)
+    local sd = ensureSyncDB()
+    if meta and meta.from and sd.peers and sd.peers[meta.from] and sd.peers[meta.from].name then
+        return sd.peers[meta.from].name
+    end
+    return sender or "?"
+end
+
 -- =============================================================================
 -- Logs (anti-spam, pero visibles cuando cambian)
 -- =============================================================================
@@ -625,12 +642,33 @@ end
 
 local function cleanupIncoming()
     local sd = ensureSyncDB()
+    sd.incomingRetryCounts = sd.incomingRetryCounts or {}
     local inc = ensureIncoming()
     local t = now()
     for k, bucket in pairs(inc) do
         if bucket.lastAt and (t - bucket.lastAt) > 25 then
+            local msgType = bucket.msgType or "?"
+            local retryKey = bucket.retryKey or (msgType .. ":" .. tostring(k))
+            sd.incomingRetryCounts[retryKey] = (sd.incomingRetryCounts[retryKey] or 0) + 1
+            local retryCount = sd.incomingRetryCounts[retryKey]
+            local retryDelay = BACKLOG_RETRY_SEC
+            local reason = "timeout " .. tostring(msgType)
+            GAT:SysMsg(
+                "sync_rx_timeout_" .. retryKey,
+                string.format("Sync: falló envío/recepción (%s), reintentando en %ds (intento %d)", reason, retryDelay, retryCount),
+                true
+            )
+
+            if msgType == "SNAP" and not GAT:IsMasterBuild() then
+                local master = getMasterPeer()
+                if master and master.sender and C_Timer and C_Timer.After then
+                    C_Timer.After(retryDelay, function()
+                        queueOutbox("WHISPER", master.sender, string.format("T=REQSNAP|from=%s", tostring(sd.clientId)))
+                    end)
+                end
+            end
+
             inc[k] = nil
-            GAT:SysMsg("sync_rx_timeout_" .. k, "Sync: transferencia incompleta (timeout). Reintenta /gat → Sync.", true)
         end
     end
 end
@@ -662,21 +700,17 @@ local function handleComplete(msgType, payload, meta, sender)
         if rejectIfNotMaster("BACK") then return end
         if not GAT:IsMasterBuild() then return end
         if meta.from == sd.clientId then return end
-        local bseq = tonumber(meta.bseq or "")
+        local fromName = getPeerName(meta, sender)
+        GAT:SysMsg("sync_back_receiving_" .. tostring(sender), "Sync: Recibiendo backlog de " .. tostring(fromName) .. "…", true)
         local delta = decodeDelta(payload)
         local ok, err = pcall(function()
             applyDelta(delta)
         end)
 
-        if ok then
-            local ack = string.format("T=BACKOK|from=%s|bseq=%s", tostring(sd.clientId), tostring(bseq or ""))
-            queueOutbox("WHISPER", sender, ack)
-            GAT:SysMsg("sync_back_applied_" .. tostring(sender), "Sync: backlog aplicado desde " .. tostring(sender), true)
-        else
-            local fail = string.format("T=BACKFAIL|from=%s|bseq=%s|reason=%s", tostring(sd.clientId), tostring(bseq or ""), pctEncode(err or "apply_error"))
-            queueOutbox("WHISPER", sender, fail)
-            GAT:SysMsg("sync_back_failed_" .. tostring(sender), "Sync: backlog falló desde " .. tostring(sender) .. " (" .. tostring(err) .. ")", true)
-        end
+        local bseq = tonumber(meta.bseq or "")
+        local ack = string.format("T=ACK|from=%s|bseq=%s", tostring(sd.clientId), tostring(bseq or ""))
+        queueOutbox("WHISPER", sender, ack)
+        GAT:SysMsg("sync_back_applied_" .. tostring(sender), "Sync: backlog aplicado ✔ desde " .. tostring(fromName), true)
         return
     end
 
@@ -699,8 +733,16 @@ local function onFragment(meta, sender)
     local inc = ensureIncoming()
     local key = incomingKey(meta)
 
-    local bucket = inc[key] or { parts = {}, got = 0, total = 0 }
+    local bucket = inc[key] or {
+        parts = {},
+        got = 0,
+        total = 0,
+        msgType = meta.T,
+        retryKey = (meta.T or "?") .. ":" .. tostring(meta.from or sender or "?"),
+    }
     bucket.lastAt = now()
+    bucket.msgType = bucket.msgType or meta.T
+    bucket.retryKey = bucket.retryKey or ((meta.T or "?") .. ":" .. tostring(meta.from or sender or "?"))
 
     local p, total = tostring(meta.part or ""):match("^(%d+)%/(%d+)$")
     local part = tonumber(p)
@@ -778,6 +820,7 @@ end
 
 local function trySendBacklog()
     local sd = ensureSyncDB()
+    sd.backlogRetryCount = sd.backlogRetryCount or {}
     if GAT:IsMasterBuild() then return end
     if not sd.masterOnline then return end
     if not sd.backlog or not hasValues(sd.backlog) then return end
@@ -786,27 +829,24 @@ local function trySendBacklog()
     if not master or not master.sender then return end
 
     if sd.backlogInFlight then
-        local bseq = sd.backlogInFlight
-        local payload = sd.backlog[bseq]
-        if not payload then
-            sd.backlogInFlight = nil
-            sd.backlogInFlightAt = nil
-            sd.backlogRetryAttempts = 0
-            sd.backlogNextRetryAt = 0
-            return
-        end
-
-        local dueAt = sd.backlogNextRetryAt or 0
-        if dueAt == 0 then
-            dueAt = (sd.backlogInFlightAt or 0) + backlogRetryDelay(sd.backlogRetryAttempts or 0)
-        end
-
-        if now() >= dueAt then
-            enqueuePayloadMessage("BACK", payload, "WHISPER", master.sender, { rev = sd.rev or 0, bseq = bseq })
-            sd.backlogInFlightAt = now()
-            sd.backlogRetryAttempts = (sd.backlogRetryAttempts or 0) + 1
-            sd.backlogNextRetryAt = sd.backlogInFlightAt + backlogRetryDelay(sd.backlogRetryAttempts)
-            GAT:SysMsg("sync_back_retry", "Sync: reintentando backlog (bseq " .. tostring(bseq) .. ", intento " .. tostring(sd.backlogRetryAttempts) .. ")", true)
+        if (now() - (sd.backlogInFlightAt or 0)) > BACKLOG_RETRY_SEC then
+            local bseq = sd.backlogInFlight
+            local payload = sd.backlog[bseq]
+            if payload then
+                sd.backlogRetryCount[bseq] = (sd.backlogRetryCount[bseq] or 0) + 1
+                local retryCount = sd.backlogRetryCount[bseq]
+                GAT:SysMsg(
+                    "sync_back_retry_" .. tostring(bseq) .. "_" .. tostring(retryCount),
+                    string.format("Sync: falló envío/recepción (timeout backlog %s), reintentando en %ds (intento %d)", tostring(bseq), BACKLOG_RETRY_SEC, retryCount),
+                    true
+                )
+                GAT:Print("GM detectado. Pasando datos al GM…")
+                enqueuePayloadMessage("BACK", payload, "WHISPER", master.sender, { rev = sd.rev or 0, bseq = bseq })
+                sd.backlogInFlightAt = now()
+            else
+                sd.backlogInFlight = nil
+                if bseq then sd.backlogRetryCount[bseq] = nil end
+            end
         end
         return
     end
@@ -817,10 +857,10 @@ local function trySendBacklog()
     end
     if not minSeq then return end
 
+    sd.backlogRetryCount[minSeq] = sd.backlogRetryCount[minSeq] or 0
     sd.backlogInFlight = minSeq
     sd.backlogInFlightAt = now()
-    sd.backlogRetryAttempts = 0
-    sd.backlogNextRetryAt = sd.backlogInFlightAt + backlogRetryDelay(sd.backlogRetryAttempts)
+    GAT:Print("GM detectado. Pasando datos al GM…")
     enqueuePayloadMessage("BACK", sd.backlog[minSeq], "WHISPER", master.sender, { rev = sd.rev or 0, bseq = minSeq })
 end
 
@@ -960,13 +1000,46 @@ function GAT:Sync_GetHelpersForUI()
     return out
 end
 
+local function backlogPendingCount()
+    local sd = ensureSyncDB()
+    return countValues(sd.backlog)
+end
+
+local function incomingInProgress()
+    local sd = ensureSyncDB()
+    if not sd.incoming then return false end
+    for _, bucket in pairs(sd.incoming) do
+        if bucket then return true end
+    end
+    return false
+end
+
+local function computeSyncState()
+    local sd = ensureSyncDB()
+    if sd.backlogInFlight or incomingInProgress() then
+        return "In progress"
+    end
+    if backlogPendingCount() > 0 then
+        return "Need sync"
+    end
+    if (not sd.lastSnapshotAppliedAt or sd.lastSnapshotAppliedAt == 0) and not GAT:IsMasterBuild() then
+        return "Need sync"
+    end
+    if not sd.masterOnline and not GAT:IsMasterBuild() then
+        return "Need sync"
+    end
+    return "Synced"
+end
+
 function GAT:Sync_GetStatusLine()
     local sd = ensureSyncDB()
     local role = sd.role or "idle"
     local mo = sd.masterOnline and "GM:ON" or "GM:OFF"
     local q = outboxSize()
     local rev = sd.rev or 0
-    return string.format("Sync:%s %s rev:%d Q:%d", role, mo, rev, q)
+    local backlog = backlogPendingCount()
+    local syncState = computeSyncState()
+    return string.format("Sync:%s %s rev:%d Q:%d | Estado:%s | Backlog:%d", role, mo, rev, q, syncState, backlog)
 end
 
 -- =============================================================================
@@ -1056,25 +1129,9 @@ local function onAddonMessage(prefix, msg, channel, sender)
             sd.backlog[bseq] = nil
             sd.backlogInFlight = nil
             sd.backlogInFlightAt = nil
-            sd.backlogRetryAttempts = 0
-            sd.backlogNextRetryAt = 0
-            GAT:SysMsg("sync_back_ack", "Sync: backlog BACKOK ✔ (bseq " .. tostring(bseq) .. ")", true)
-        end
-        return
-    end
-
-    if t == "BACKFAIL" then
-        if GAT:IsMasterBuild() then return end
-        local sd = ensureSyncDB()
-        local bseq = tonumber(meta.bseq or "")
-        if bseq and sd.backlog and sd.backlog[bseq] then
-            sd.backlogInFlight = bseq
-            sd.backlogInFlightAt = now()
-            sd.backlogRetryAttempts = (sd.backlogRetryAttempts or 0) + 1
-            local delay = backlogRetryDelay(sd.backlogRetryAttempts)
-            sd.backlogNextRetryAt = sd.backlogInFlightAt + delay
-            local reason = pctDecode(meta.reason or "")
-            GAT:SysMsg("sync_back_fail", string.format("Sync: backlog BACKFAIL (bseq %s): %s. Reintentando en %ds", tostring(bseq), tostring(reason or "error"), math.floor(delay)), true)
+            sd.backlogRetryCount = sd.backlogRetryCount or {}
+            sd.backlogRetryCount[bseq] = nil
+            GAT:SysMsg("sync_back_ack", "Sync: backlog ACK ✔ (bseq " .. tostring(bseq) .. ")", true)
         end
         return
     end
