@@ -29,6 +29,12 @@ local MAX_MSG_LEN         = 240
 -- Stats incluidos en snapshots (últimos 7 días)
 local SNAPSHOT_STATS_WINDOW = 7 * 24 * 3600
 
+-- Forward decls (para evitar referencias nil en definiciones adelantadas)
+local computeRole
+local getMasterPeer
+local buildHelperNetworkSummary
+local emitHelperNetworkStatus
+
 -- =============================================================================
 -- Utilidades
 -- =============================================================================
