@@ -550,7 +550,7 @@ local function prunePeers()
     end
 end
 
-local function buildHelperNetworkSummary()
+buildHelperNetworkSummary = function()
     local sd = ensureSyncDB()
     local t = now()
 
@@ -606,7 +606,7 @@ local function buildHelperNetworkSummary()
     return summary
 end
 
-local function emitHelperNetworkStatus(tag)
+emitHelperNetworkStatus = function(tag)
     local summary = buildHelperNetworkSummary()
     if not summary then return end
 
@@ -625,7 +625,7 @@ local function emitHelperNetworkStatus(tag)
     GAT:SysMsg("sync_topology_status", msg, true)
 end
 
-local function computeRole()
+computeRole = function()
     local sd = ensureSyncDB()
     prunePeers()
 
@@ -706,7 +706,7 @@ local function computeRole()
     return newRole
 end
 
-local function getMasterPeer()
+getMasterPeer = function()
     local sd = ensureSyncDB()
     if not sd.masterPeerId then return nil end
     return (sd.peers or {})[sd.masterPeerId]
