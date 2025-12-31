@@ -461,6 +461,11 @@ local function markPeer(sender, payload)
         GAT:SysMsg("sync_peer_on_" .. cid, "Sync: " .. (peer.name or cid) .. " online", true)
     end
 
+    if payload.master == "1" then
+        sd.masterPeerId = cid
+        sd.masterOnline = true
+    end
+
     sd.peers[cid] = peer
 
     -- Auto-snapshot: si soy Master build y aparece un helper nuevo, le empujo snapshot.
@@ -478,8 +483,6 @@ local function markPeer(sender, payload)
 
     -- Marca al GM inmediatamente y fuerza reevaluar rol/backlog sin esperar el siguiente tick.
     if payload.master == "1" then
-        sd.masterPeerId = cid
-        sd.masterOnline = true
         if not GAT:IsMasterBuild() then
             computeRole()
             trySendBacklog()
@@ -614,6 +617,19 @@ end
 
 local function handleComplete(msgType, payload, meta, sender)
     local sd = ensureSyncDB()
+    local function isAuthorizedMaster()
+        if GAT:IsMasterBuild() then return true end
+        local fromId = meta.from
+        if not fromId or fromId ~= sd.masterPeerId then return false end
+        local peer = (sd.peers or {})[fromId]
+        return peer and peer.isMaster == true
+    end
+
+    local function rejectIfNotMaster(tag)
+        if isAuthorizedMaster() then return false end
+        GAT:SysMsg("sync_reject_" .. tostring(tag or msgType), "Sync: rechazado: remitente no es GM", true)
+        return true
+    end
 
     if msgType == "U" then
         if meta.from == sd.clientId then return end
@@ -623,6 +639,7 @@ local function handleComplete(msgType, payload, meta, sender)
     end
 
     if msgType == "BACK" then
+        if rejectIfNotMaster("BACK") then return end
         if not GAT:IsMasterBuild() then return end
         if meta.from == sd.clientId then return end
         local delta = decodeDelta(payload)
@@ -636,6 +653,7 @@ local function handleComplete(msgType, payload, meta, sender)
     end
 
     if msgType == "SNAP" then
+        if rejectIfNotMaster("SNAP") then return end
         applySnapshot(payload)
         sd.lastSnapshotAppliedAt = now()
         GAT:SysMsg("sync_rx_snap", "Sync: snapshot aplicado ✔", true)
@@ -943,6 +961,17 @@ local function onAddonMessage(prefix, msg, channel, sender)
 
     if t == "ACK" then
         local sd = ensureSyncDB()
+        local function isAuthorizedMaster()
+            if GAT:IsMasterBuild() then return true end
+            local fromId = meta.from
+            if not fromId or fromId ~= sd.masterPeerId then return false end
+            local peer = (sd.peers or {})[fromId]
+            return peer and peer.isMaster == true
+        end
+        if not isAuthorizedMaster() then
+            GAT:SysMsg("sync_reject_ACK", "Sync: rechazado: remitente no es GM", true)
+            return
+        end
         local bseq = tonumber(meta.bseq or "")
         if bseq and sd.backlogInFlight and tonumber(sd.backlogInFlight) == bseq then
             sd.backlog[bseq] = nil
@@ -963,6 +992,17 @@ local function onAddonMessage(prefix, msg, channel, sender)
     end
 
     if t == "DEL" then
+        local function isAuthorizedMaster()
+            if GAT:IsMasterBuild() then return true end
+            local fromId = meta.from
+            if not fromId or fromId ~= ensureSyncDB().masterPeerId then return false end
+            local peer = ((ensureSyncDB().peers) or {})[fromId]
+            return peer and peer.isMaster == true
+        end
+        if not isAuthorizedMaster() then
+            GAT:SysMsg("sync_reject_DEL", "Sync: rechazado: remitente no es GM", true)
+            return
+        end
         local name = pctDecode(meta.name or "")
         if name and name ~= "" and GAT.db and GAT.db.data then
             GAT.db.data[name] = nil
