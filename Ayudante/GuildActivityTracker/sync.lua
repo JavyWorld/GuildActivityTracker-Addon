@@ -51,9 +51,15 @@ local function safeCall(tag, fn)
 end
 
 local function safeSend(channel, target, msg)
-    if not isInGuildScope() then return end
+    if not isInGuildScope() then
+        GAT:SysMsg("sync_scope_block", "Sync: envíos bloqueados (personaje fuera del ámbito de guild objetivo)", true)
+        return
+    end
     if not C_ChatInfo or not C_ChatInfo.SendAddonMessage then return end
-    local ok = pcall(C_ChatInfo.SendAddonMessage, PREFIX, msg, channel, target)
+    local ok, err = pcall(C_ChatInfo.SendAddonMessage, PREFIX, msg, channel, target)
+    if not ok then
+        GAT:SysMsg("sync_send_err_" .. tostring(channel), string.format("Sync: error al enviar por %s%s: %s", tostring(channel), target and (" -> " .. tostring(target)) or "", tostring(err)), true)
+    end
     return ok
 end
 
